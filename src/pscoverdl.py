@@ -25,12 +25,13 @@ PS2_COVERS_URL_3D = (
 
 
 class BaseCoverDownloader:
-    def __init__(self, cover_dir, gamelist_dir, cover_type, use_ssl, emulator):
+    def __init__(self, cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback=False):
         self.cover_dir = Path(cover_dir)
         self.gamelist_dir = gamelist_dir
         self.cover_type = cover_type
         self.use_ssl = use_ssl
         self.emulator = emulator
+        self.fallback = fallback
 
     def get_serial_list(self, gamelist_cache_path, existing_covers):
         if not os.path.exists(gamelist_cache_path):
@@ -55,14 +56,11 @@ class BaseCoverDownloader:
             return serial_list
 
     def existing_covers(self):
-        # Phase 1 Fix: original glob was "*.jpg" only, so .png (3D covers) were
-        # never detected as existing and would be re-downloaded every run.
-        covers = [
-            f.stem
-            for ext in ("*.jpg", "*.png")
-            for f in self.cover_dir.glob(ext)
-        ]
-        return covers
+        covers = set()
+        for pattern in ("*.jpg", "*.png"):
+            for filename in self.cover_dir.glob(pattern):
+                covers.add(filename.stem)
+        return list(covers)
 
     def serial_to_name(self, name_list, game_serial):
         return name_list.get(game_serial)
@@ -129,6 +127,7 @@ class BaseCoverDownloader:
                 results.append(executor.submit(
                     self.download_cover, url, cover_path))
 
+            failed = []
             for result, url in tqdm(
                 zip(results, cover_urls),
                 total=len(cover_urls),
@@ -144,17 +143,51 @@ class BaseCoverDownloader:
                     tqdm.write(
                         colored(f"{game_serial} | {game_name}", "green"))
                 else:
-                    tqdm.write(
-                        colored(
-                            f"[{game_serial} | {game_name}] not found. Skipping...",
-                            "yellow",
+                    failed.append((game_serial, game_name))
+
+        if failed and self.fallback:
+            if self.cover_type == 1:
+                fallback_url_base = covers_url_default
+                fallback_ext = ".jpg"
+            else:
+                fallback_url_base = covers_url_3d
+                fallback_ext = ".png"
+
+            fallback_urls = [
+                f"{fallback_url_base}/{serial}{fallback_ext}"
+                for serial, _ in failed
+            ]
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as fallback_executor:
+                fallback_results = []
+                for fb_url in fallback_urls:
+                    cover_path = self.cover_dir.joinpath(Path(fb_url).name)
+                    fallback_results.append(fallback_executor.submit(self.download_cover, fb_url, cover_path))
+
+                for fb_result, (serial, name) in tqdm(
+                    zip(fallback_results, failed),
+                    total=len(failed),
+                    desc="Downloading fallbacks",
+                    unit="cover",
+                    ncols=50,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
+                ):
+                    if fb_result.result():
+                        tqdm.write(colored(f"{serial} | {name} (fallback)", "green"))
+                    else:
+                        tqdm.write(
+                            colored(
+                                f"[{serial} | {name}] not found. Skipping...", "yellow"
+                            )
                         )
-                    )
+        elif failed:
+            for serial, name in failed:
+                print(colored(f"[{serial} | {name}] not found. Skipping...", "yellow"))
 
 
 class PCSX2CoverDownloader(BaseCoverDownloader):
-    def __init__(self, cover_dir, gamelist_dir, cover_type, use_ssl, emulator):
-        super().__init__(cover_dir, gamelist_dir, cover_type, use_ssl, emulator)
+    def __init__(self, cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback=False):
+        super().__init__(cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback)
 
     def get_name_list(self):
         name_list = {}
@@ -177,8 +210,8 @@ class PCSX2CoverDownloader(BaseCoverDownloader):
 
 
 class DuckStationCoverDownloader(BaseCoverDownloader):
-    def __init__(self, cover_dir, gamelist_dir, cover_type, use_ssl, emulator):
-        super().__init__(cover_dir, gamelist_dir, cover_type, use_ssl, emulator)
+    def __init__(self, cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback=False):
+        super().__init__(cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback)
 
     def get_name_list(self):
         name_list = {}
@@ -198,14 +231,14 @@ class DuckStationCoverDownloader(BaseCoverDownloader):
         return name_list
 
 
-def download_covers(cover_dir, gamelist_dir, cover_type, use_ssl, emulator):
+def download_covers(cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback=False):
     if emulator == "pcsx2":
         downloader = PCSX2CoverDownloader(
-            cover_dir, gamelist_dir, cover_type, use_ssl, emulator
+            cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback
         )
     elif emulator == "duckstation":
         downloader = DuckStationCoverDownloader(
-            cover_dir, gamelist_dir, cover_type, use_ssl, emulator
+            cover_dir, gamelist_dir, cover_type, use_ssl, emulator, fallback
         )
     else:
         print(colored(f"[ERROR]: Invalid emulator: {emulator}", "red"))
