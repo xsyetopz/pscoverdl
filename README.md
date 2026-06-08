@@ -1,6 +1,6 @@
 PSCoverDL
 
-![image](<img width="752" height="604" alt="image" src="https://github.com/user-attachments/assets/0df98ff0-e652-4713-8aae-2eaa1db2b14c" />)
+![image](https://github.com/user-attachments/assets/0df98ff0-e652-4713-8aae-2eaa1db2b14c)
 
 ### Features
 
