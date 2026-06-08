@@ -19,6 +19,7 @@
 package gui
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -31,6 +32,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -87,10 +89,26 @@ type App struct {
 }
 
 var commandContext = exec.CommandContext
+var statFile = os.Stat
+var getenv = os.Getenv
+var userHomeDir = os.UserHomeDir
+var currentOS = runtime.GOOS
 
 // NewApp creates a Wails GUI backend.
 func NewApp(cliPath string) *App {
-	return &App{cliPath: cliPath}
+	return &App{cliPath: normalizeCLIPath(cliPath)}
+}
+
+func normalizeCLIPath(cliPath string) string {
+	cliPath = strings.TrimSpace(cliPath)
+	if cliPath == "" || filepath.IsAbs(cliPath) {
+		return cliPath
+	}
+	absPath, err := filepath.Abs(cliPath)
+	if err != nil {
+		return cliPath
+	}
+	return absPath
 }
 
 // Startup stores the Wails context for dialogs and cancellation.
@@ -115,7 +133,7 @@ func BuildCLIArgs(cfg Config) ([]string, error) {
 		return nil, errors.New("cover directory is required")
 	}
 	if strings.TrimSpace(cfg.GameListPath) == "" {
-		return nil, errors.New("game cache is required")
+		return nil, errors.New("gamelist.cache file is required")
 	}
 	if cfg.CoverType != "default" && cfg.CoverType != "3d" {
 		return nil, errors.New("cover type must be default or 3d")
@@ -149,16 +167,16 @@ func DefaultCLIPath() string {
 // ConfigPath returns the platform-specific GUI configuration path.
 func ConfigPath() (string, error) {
 	var base string
-	switch runtime.GOOS {
+	switch currentOS {
 	case "windows":
-		base = os.Getenv("APPDATA")
+		base = getenv("APPDATA")
 		if base == "" {
 			base = homeDir()
 		}
 	case "darwin":
 		base = filepath.Join(homeDir(), "Library", "Application Support")
 	default:
-		base = os.Getenv("XDG_CONFIG_HOME")
+		base = getenv("XDG_CONFIG_HOME")
 		if base == "" {
 			base = filepath.Join(homeDir(), ".config")
 		}
@@ -167,7 +185,6 @@ func ConfigPath() (string, error) {
 		return "", errors.New("cannot determine config directory")
 	}
 	dir := filepath.Join(base, "pscoverdl")
-	//nolint:gosec // APPDATA/XDG_CONFIG_HOME are platform-defined user config roots.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -191,7 +208,13 @@ func LoadConfigFile() StoredConfig {
 		return cfg
 	}
 	_ = json.Unmarshal(data, &cfg)
+	applyMissingDefaults(&cfg)
 	return cfg
+}
+
+// DetectDefaults returns detected paths for an emulator tab.
+func (a *App) DetectDefaults(emulator string) EmulatorConfig {
+	return defaultEmulatorConfig(emulator)
 }
 
 // SaveConfig persists GUI settings from the frontend.
@@ -233,7 +256,7 @@ func (a *App) SelectGameCache() string {
 		return ""
 	}
 	path, err := wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
-		Title:   "Select gamelist.cache",
+		Title:   "Select gamelist.cache file",
 		Filters: []wailsRuntime.FileFilter{{DisplayName: "Game cache (*.cache)", Pattern: "*.cache"}},
 	})
 	if err != nil {
@@ -260,12 +283,55 @@ func (a *App) StartDownload(cfg Config) DownloadResult {
 	if a.ctx != nil {
 		ctx = a.ctx
 	}
+	if _, statErr := statFile(cliPath); statErr != nil {
+		return DownloadResult{Error: fmt.Sprintf("pscoverdl CLI not found at %s. Run `just build-cli` or pass `-cli /path/to/pscoverdl`.", cliPath)}
+	}
+
 	cmd := commandContext(ctx, cliPath, args...)
 	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	err = cmd.Run()
-	result := DownloadResult{Command: cliPath + " " + strings.Join(args, " "), Output: output.String()}
+	var outputMu sync.Mutex
+	appendOutput := func(line string) {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		output.WriteString(line)
+		output.WriteByte('\n')
+		if a.ctx != nil {
+			wailsRuntime.EventsEmit(a.ctx, "download-progress", line)
+		}
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return DownloadResult{Error: err.Error()}
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return DownloadResult{Error: err.Error()}
+	}
+
+	commandLine := cliPath + " " + strings.Join(args, " ")
+	if a.ctx != nil {
+		wailsRuntime.EventsEmit(a.ctx, "download-progress", commandLine)
+	}
+	if err = cmd.Start(); err != nil {
+		return DownloadResult{Command: commandLine, Error: err.Error()}
+	}
+
+	var wg sync.WaitGroup
+	for _, pipe := range []interface{ Read([]byte) (int, error) }{stdout, stderr} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			scanner := bufio.NewScanner(pipe)
+			for scanner.Scan() {
+				appendOutput(scanner.Text())
+			}
+		}()
+	}
+	err = cmd.Wait()
+	wg.Wait()
+	outputMu.Lock()
+	result := DownloadResult{Command: commandLine, Output: output.String()}
+	outputMu.Unlock()
 	if err != nil {
 		result.Error = err.Error()
 	}
@@ -297,13 +363,134 @@ func (a *App) CheckUpdates() UpdateStatus {
 
 func defaultStoredConfig() StoredConfig {
 	return StoredConfig{
-		DuckStation: EmulatorConfig{CoverType: 0, UseSSL: true},
-		PCSX2:       EmulatorConfig{CoverType: 0, UseSSL: true},
+		DuckStation: defaultEmulatorConfig("duckstation"),
+		PCSX2:       defaultEmulatorConfig("pcsx2"),
 	}
 }
 
+func defaultEmulatorConfig(emulator string) EmulatorConfig {
+	coverDir, gameCache := detectDefaultPaths(emulator)
+	return EmulatorConfig{CoverDirectory: coverDir, GameCache: gameCache, CoverType: 0, UseSSL: true}
+}
+
+func applyMissingDefaults(cfg *StoredConfig) {
+	fillMissingDefaults(&cfg.DuckStation, "duckstation")
+	fillMissingDefaults(&cfg.PCSX2, "pcsx2")
+}
+
+func fillMissingDefaults(cfg *EmulatorConfig, emulator string) {
+	defaults := defaultEmulatorConfig(emulator)
+	if strings.TrimSpace(cfg.CoverDirectory) == "" {
+		cfg.CoverDirectory = defaults.CoverDirectory
+	}
+	if strings.TrimSpace(cfg.GameCache) == "" {
+		cfg.GameCache = defaults.GameCache
+	}
+}
+
+type defaultPathSet struct {
+	Root   string
+	Covers string
+	Cache  string
+}
+
+func detectDefaultPaths(emulator string) (string, string) {
+	candidates := defaultPathCandidates(strings.ToLower(strings.TrimSpace(emulator)))
+	for _, candidate := range candidates {
+		if isFile(candidate.Cache) {
+			return candidate.Covers, candidate.Cache
+		}
+	}
+	for _, candidate := range candidates {
+		if isDir(candidate.Covers) {
+			return candidate.Covers, candidate.Cache
+		}
+	}
+	for _, candidate := range candidates {
+		if isDir(candidate.Root) {
+			return candidate.Covers, candidate.Cache
+		}
+	}
+	return "", ""
+}
+
+func defaultPathCandidates(emulator string) []defaultPathSet {
+	switch emulator {
+	case "pcsx2":
+		return defaultPathCandidatesFor("PCSX2", "pcsx2", "net.pcsx2.PCSX2")
+	case "duckstation":
+		return defaultPathCandidatesFor("DuckStation", "duckstation", "org.duckstation.DuckStation")
+	default:
+		return nil
+	}
+}
+
+func defaultPathCandidatesFor(name, lowerName, flatpakID string) []defaultPathSet {
+	home := homeDir()
+	var roots []string
+	switch currentOS {
+	case "windows":
+		roots = appendNonEmpty(roots,
+			filepath.Join(getenv("ProgramFiles"), name),
+			filepath.Join(getenv("ProgramFiles(x86)"), name),
+			filepath.Join(home, "Documents", name),
+			filepath.Join(getenv("APPDATA"), name),
+		)
+	case "darwin":
+		roots = appendNonEmpty(roots, filepath.Join(home, "Library", "Application Support", name))
+	default:
+		configHome := getenv("XDG_CONFIG_HOME")
+		if configHome == "" && home != "" {
+			configHome = filepath.Join(home, ".config")
+		}
+		dataHome := getenv("XDG_DATA_HOME")
+		if dataHome == "" && home != "" {
+			dataHome = filepath.Join(home, ".local", "share")
+		}
+		roots = appendNonEmpty(roots,
+			filepath.Join(configHome, lowerName),
+			filepath.Join(configHome, name),
+			filepath.Join(dataHome, lowerName),
+			filepath.Join(dataHome, name),
+			filepath.Join(home, ".var", "app", flatpakID, "config", lowerName),
+			filepath.Join(home, ".var", "app", flatpakID, "config", name),
+			filepath.Join(home, ".var", "app", flatpakID, "data", lowerName),
+			filepath.Join(home, ".var", "app", flatpakID, "data", name),
+		)
+	}
+
+	sets := make([]defaultPathSet, 0, len(roots))
+	for _, root := range roots {
+		sets = append(sets, defaultPathSet{
+			Root:   root,
+			Covers: filepath.Join(root, "covers"),
+			Cache:  filepath.Join(root, "cache", "gamelist.cache"),
+		})
+	}
+	return sets
+}
+
+func appendNonEmpty(values []string, paths ...string) []string {
+	for _, path := range paths {
+		if path != "" && path != "." {
+			values = append(values, path)
+		}
+	}
+	return values
+}
+
+func isDir(path string) bool {
+	info, err := statFile(path)
+	return err == nil && info.IsDir()
+}
+
+func isFile(path string) bool {
+	info, err := statFile(path)
+	return err == nil && !info.IsDir()
+}
+
 func homeDir() string {
-	home, _ := os.UserHomeDir()
+	home, _ := userHomeDir()
 	return home
 }
 

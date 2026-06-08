@@ -22,9 +22,11 @@ func main() {
 
 	app := gui.NewApp(*cli)
 	if err := wails.Run(&options.App{
-		Title:  "PSCoverDL - " + gui.CurrentVersion,
-		Width:  450,
-		Height: 400,
+		Title:     "PSCoverDL - " + gui.CurrentVersion,
+		Width:     640,
+		Height:    460,
+		MinWidth:  560,
+		MinHeight: 420,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},

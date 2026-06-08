@@ -23,8 +23,9 @@ build-gui:
     mkdir -p dist/host
     go build -tags production -trimpath -o dist/host/pscoverdl-gui ./cmd/pscoverdl-gui
 
-run-gui cli='':
-    assetdir=cmd/pscoverdl-gui/frontend/dist go run -tags dev ./cmd/pscoverdl-gui {{ if cli != '' { '-cli ' + quote(cli) } else { '' } }}
+run-gui cli='dist/host/pscoverdl':
+    just build-cli
+    assetdir=cmd/pscoverdl-gui/frontend/dist go run -tags dev ./cmd/pscoverdl-gui -cli {{ quote(cli) }}
 
 run-cli *args:
     go run ./cmd/pscoverdl {{ args }}

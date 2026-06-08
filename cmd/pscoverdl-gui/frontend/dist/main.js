@@ -4,8 +4,18 @@ let currentConfig = null;
 
 const $ = (id) => document.getElementById(id);
 
+const emulatorLabels = {
+	duckstation: "DuckStation",
+	pcsx2: "PCSX2",
+};
+
 function setSelected(emulator) {
 	_selected = emulator;
+	const label = emulatorLabels[emulator] || emulator;
+	const title = $("panel-title");
+	const pill = $("emulator-pill");
+	if (title) title.textContent = label;
+	if (pill) pill.textContent = label;
 	document.querySelectorAll(".nav-button").forEach((button) => {
 		button.classList.toggle("active", button.dataset.emulator === emulator);
 	});
@@ -66,6 +76,15 @@ function cliConfig(emulator) {
 	};
 }
 
+function appendOutput(line) {
+	const output = $("output");
+	if (!output || !line) return;
+	output.textContent = output.textContent
+		? `${output.textContent}\n${line}`
+		: line;
+	output.scrollTop = output.scrollHeight;
+}
+
 function setBusy(busy) {
 	document.querySelectorAll("button").forEach((button) => {
 		button.disabled = busy;
@@ -99,18 +118,29 @@ async function browse(emulator, kind) {
 	$(id).value = path;
 }
 
+async function detectPaths(emulator) {
+	const api = bridge();
+	if (!api) return;
+	const cfg = await api.DetectDefaults(emulator);
+	writeEmulator(emulator, { ...readEmulator(emulator), ...cfg });
+}
+
 async function startDownload(emulator) {
 	const api = bridge();
 	if (!api) return;
 	const output = $("output");
-	output.textContent = "Downloading...";
+	output.textContent = "";
+	appendOutput("Running pscoverdl...");
 	setBusy(true);
 	const result = await api.StartDownload(cliConfig(emulator));
 	await saveConfig();
 	setBusy(false);
-	output.textContent = [result.command, result.error, result.output]
-		.filter(Boolean)
-		.join("\n");
+	if (result.error) appendOutput(result.error);
+	if (!output.textContent.trim()) {
+		output.textContent = [result.command, result.output]
+			.filter(Boolean)
+			.join("\n");
+	}
 }
 
 function wireEvents() {
@@ -130,9 +160,15 @@ function wireEvents() {
 			startDownload(button.dataset.start);
 		});
 	});
+	document.querySelectorAll("[data-detect]").forEach((button) => {
+		button.addEventListener("click", () => detectPaths(button.dataset.detect));
+	});
 	$("cover-form").addEventListener("submit", (event) => event.preventDefault());
 }
 
 wireEvents();
+if (window.runtime?.EventsOn) {
+	window.runtime.EventsOn("download-progress", appendOutput);
+}
 setSelected("duckstation");
 loadConfig();
